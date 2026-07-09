@@ -1,0 +1,6 @@
+require("geferg.options")
+require("geferg.keymaps")
+require("geferg.autocmds")
+require("geferg.lsp")
+require("geferg.plugins")
+require("geferg.search")
