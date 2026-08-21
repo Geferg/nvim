@@ -136,3 +136,73 @@ vim.lsp.enable({
     "rust_analyzer",
     "ts_ls",
 })
+
+local function neotree_diagnostics_from_node()
+    local ok, manager = pcall(require, "neo-tree.sources.manager")
+    if not ok then
+        vim.notify("neo-tree is not available", vim.log.levels.ERROR)
+        return
+    end
+
+    local state = manager.get_state("filesystem")
+    if not state or not state.tree then
+        vim.notify("neo-tree filesystem state is not available", vim.log.levels.WARN)
+        return
+    end
+
+    local node = state.tree:get_node()
+    local path = node and node.path or vim.fn.getcwd()
+
+    if vim.fn.filereadable(path) == 1 then
+        path = vim.fs.dirname(path)
+    end
+
+    path = vim.fs.normalize(vim.fn.fnamemodify(path, ":p"))
+
+    local old_makeprg = vim.o.makeprg
+    local old_efm = vim.o.errorformat
+
+    vim.o.makeprg = "npx tsc --noEmit --pretty false"
+    vim.o.errorformat = "%f(%l\\,%c):\\ %trror\\ TS%n:\\ %m,%f(%l\\,%c):\\ %tarning\\ TS%n:\\ %m"
+
+    local make_ok, err = pcall(function()
+        vim.cmd("silent make!")
+    end)
+
+    vim.o.makeprg = old_makeprg
+    vim.o.errorformat = old_efm
+
+    if not make_ok then
+        vim.notify(tostring(err), vim.log.levels.ERROR)
+        return
+    end
+
+    local items = vim.fn.getqflist()
+
+    items = vim.tbl_filter(function(item)
+        if item.bufnr == 0 then
+            return false
+        end
+
+        local filename = vim.api.nvim_buf_get_name(item.bufnr)
+        if filename == "" then
+            return false
+        end
+
+        filename = vim.fs.normalize(vim.fn.fnamemodify(filename, ":p"))
+
+        return filename == path
+            or vim.startswith(filename, path .. "/")
+    end, items)
+
+    vim.fn.setqflist({}, "r", {
+        title = "Diagnostics: " .. path,
+        items = items,
+    })
+
+    vim.cmd("copen")
+end
+
+vim.keymap.set("n", "<leader>sd", neotree_diagnostics_from_node, {
+    desc = "Diagnostics from Neo-tree node",
+})
