@@ -27,3 +27,7 @@ map("n", "<C-d>", "<C-d>zz", { desc = "Half-page down" })
 map("n", "<C-u>", "<C-u>zz", { desc = "Half-page up" })
 map("n", "n", "nzzzv", { desc = "Next search result" })
 map("n", "N", "Nzzzv", { desc = "Previous search result" })
+
+map("n", "<leader>sd", function()
+    require("geferg.diagnostics").current_buffer()
+end, { desc = "Diagnostics for current file" })
