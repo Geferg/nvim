@@ -1,45 +1,18 @@
 local M = {}
 
-local severity_to_qf_type = {
-    [vim.diagnostic.severity.ERROR] = "E",
-    [vim.diagnostic.severity.WARN] = "W",
-    [vim.diagnostic.severity.INFO] = "I",
-    [vim.diagnostic.severity.HINT] = "N",
-}
+local function normalize_path(path)
+    path = vim.fs.normalize(vim.fn.fnamemodify(path, ":p"))
 
-local function normalize_path(path, cwd)
-    return vim.fs.normalize(vim.fs.abspath(path, { cwd = cwd }))
+    local real = vim.uv.fs_realpath(path)
+
+    if real then
+        return vim.fs.normalize(real)
+    end
+
+    return path
 end
 
-local function compact_message(message)
-    local lines = vim.split(message, "\n", {
-        plain = true,
-        trimempty = true,
-    })
-
-    if #lines <= 1 then
-        return vim.trim(message)
-    end
-
-    local property
-
-    for _, line in ipairs(lines) do
-        local text = vim.trim(line)
-
-        property = text:match("^Types of property '([^']+)' are incompatible%.$")
-            or property
-    end
-
-    local cause = vim.trim(lines[#lines])
-
-    if property then
-        return ("%s: %s"):format(property, cause)
-    end
-
-    return cause
-end
-
-local function set_quickfix(title, items, empty_message)
+local function open_quickfix(title, items)
     vim.fn.setqflist({}, "r", {
         title = title,
         items = items,
@@ -47,106 +20,220 @@ local function set_quickfix(title, items, empty_message)
 
     if #items == 0 then
         vim.cmd("cclose")
-        vim.notify(empty_message)
         return
     end
 
     vim.cmd("copen")
 end
 
-local function diagnostic_code(diagnostic)
-    if diagnostic.code then
-        return tonumber(diagnostic.code) or 0
-    end
+local function selected_scope(path)
+    path = normalize_path(path)
 
-    local lsp = diagnostic.user_data and diagnostic.user_data.lsp
-
-    if lsp and lsp.code then
-        return tonumber(lsp.code) or 0
-    end
-
-    return 0
-end
-
-local function parse_tsc_output(output, cwd)
-    local items = {}
-    local current
-
-    local function finish()
-        if not current then
-            return
-        end
-
-        local message = current.message
-
-        if #current.details > 0 then
-            message = message .. "\n" .. table.concat(current.details, "\n")
-        end
-
-        items[#items + 1] = {
-            filename = normalize_path(current.filename, cwd),
-            lnum = current.lnum,
-            col = current.col,
-            type = current.severity == "warning" and "W" or "E",
-            nr = current.code,
-            text = compact_message(message),
+    if vim.fn.filereadable(path) == 1 then
+        return {
+            path = path,
+            kind = "file",
         }
-
-        current = nil
     end
 
-    for line in output:gmatch("[^\r\n]+") do
-        local filename, lnum, col, severity, code, message =
-            line:match("^(.*)%((%d+),(%d+)%)%: (%a+) TS(%d+)%: (.*)$")
-
-        if filename then
-            finish()
-
-            current = {
-                filename = filename,
-                lnum = tonumber(lnum),
-                col = tonumber(col),
-                severity = severity,
-                code = tonumber(code),
-                message = message,
-                details = {},
-            }
-        elseif current and line:match("^%s+") then
-            current.details[#current.details + 1] = vim.trim(line)
-        end
-    end
-
-    finish()
-
-    return items
+    return {
+        path = path,
+        kind = "directory",
+    }
 end
 
-local function find_typescript_config(path, is_file)
-    local start = is_file and vim.fs.dirname(path) or path
+local function find_typescript_config(path)
+    local start = path
 
-    return vim.fs.find(
+    if vim.fn.filereadable(start) == 1 then
+        start = vim.fs.dirname(start)
+    end
+
+    local configs = vim.fs.find(
         { "tsconfig.json", "jsconfig.json" },
         {
             path = start,
             upward = true,
             type = "file",
         }
-    )[1]
-end
+    )
 
-local function filter_to_path(items, path, is_file)
-    if is_file then
-        return vim.tbl_filter(function(item)
-            return item.filename == path
-        end, items)
+    if not configs[1] then
+        return nil
     end
 
-    local prefix = path .. "/"
+    return normalize_path(configs[1])
+end
 
+local function find_repo_root(path)
+    local start = path
+
+    if vim.fn.filereadable(start) == 1 then
+        start = vim.fs.dirname(start)
+    end
+
+    local root = vim.fs.root(start, { ".git" })
+
+    if root then
+        return normalize_path(root)
+    end
+
+    return normalize_path(vim.fn.getcwd())
+end
+
+local function is_absolute_path(path)
+    return path:sub(1, 1) == "/"
+        or path:match("^%a:[/\\]") ~= nil
+        or path:match("^[/\\][/\\]") ~= nil
+end
+
+local function resolve_diagnostic_path(filename, cwd)
+    if is_absolute_path(filename) then
+        return normalize_path(filename)
+    end
+
+    return normalize_path(
+        vim.fs.joinpath(cwd, filename)
+    )
+end
+
+local function compact_message(lines)
+    local parts = {}
+
+    for _, line in ipairs(lines) do
+        local text = vim.trim(line)
+
+        if text ~= "" then
+            table.insert(parts, text)
+        end
+    end
+
+    return table.concat(parts, " ")
+end
+
+local function parse_tsc_output(output, cwd)
+    local items = {}
+    local current = nil
+
+    local function finish_current()
+        if not current then
+            return
+        end
+
+        current.text = compact_message(
+            current.message_lines
+        )
+        current.message_lines = nil
+
+        table.insert(items, current)
+        current = nil
+    end
+
+    for line in vim.gsplit(output, "\n", {
+        plain = true,
+    }) do
+        local filename,
+            lnum,
+            col,
+            severity,
+            code,
+            message =
+            line:match(
+                "^(.-)%((%d+),(%d+)%)%: (%a+) TS(%d+): (.*)$"
+            )
+
+        if filename then
+            finish_current()
+
+            local type_map = {
+                error = "E",
+                warning = "W",
+                info = "I",
+            }
+
+            current = {
+                filename = resolve_diagnostic_path(
+                    filename,
+                    cwd
+                ),
+                lnum = tonumber(lnum),
+                col = tonumber(col),
+                nr = tonumber(code),
+                type = type_map[severity] or "E",
+                message_lines = { message },
+            }
+        elseif current then
+            local trimmed = vim.trim(line)
+
+            if
+                trimmed ~= ""
+                and not trimmed:match("^Found %d+ error")
+                and not trimmed:match("^Errors%s+Files")
+            then
+                table.insert(
+                    current.message_lines,
+                    trimmed
+                )
+            end
+        end
+    end
+
+    finish_current()
+
+    return items
+end
+
+local function is_inside_directory(filename, directory)
+    filename = normalize_path(filename)
+    directory = normalize_path(directory)
+
+    local relative = vim.fs.relpath(
+        directory,
+        filename
+    )
+
+    if relative == nil then
+        return false
+    end
+
+    return relative ~= ".."
+        and not vim.startswith(relative, "../")
+end
+
+local function filter_to_scope(items, scope)
     return vim.tbl_filter(function(item)
-        return item.filename == path
-            or vim.startswith(item.filename, prefix)
+        if not item.filename or item.filename == "" then
+            return false
+        end
+
+        local filename = normalize_path(
+            item.filename
+        )
+
+        if scope.kind == "file" then
+            return filename == scope.path
+        end
+
+        return is_inside_directory(
+            filename,
+            scope.path
+        )
     end, items)
+end
+
+local function process_failure_message(result)
+    local stderr = vim.trim(result.stderr or "")
+    local stdout = vim.trim(result.stdout or "")
+
+    if stderr ~= "" then
+        return stderr
+    end
+
+    if stdout ~= "" then
+        return stdout
+    end
+
+    return "TypeScript diagnostics failed"
 end
 
 function M.current_buffer()
@@ -154,60 +241,55 @@ function M.current_buffer()
     local filename = vim.api.nvim_buf_get_name(bufnr)
 
     if filename == "" then
-        vim.notify("Current buffer has no file", vim.log.levels.WARN)
-        return
-    end
-
-    local items = {}
-
-    for _, diagnostic in ipairs(vim.diagnostic.get(bufnr)) do
-        items[#items + 1] = {
-            bufnr = bufnr,
-            lnum = diagnostic.lnum + 1,
-            col = diagnostic.col + 1,
-            type = severity_to_qf_type[diagnostic.severity],
-            nr = diagnostic_code(diagnostic),
-            text = compact_message(diagnostic.message),
-        }
-    end
-
-    table.sort(items, function(a, b)
-        if a.lnum == b.lnum then
-            return a.col < b.col
-        end
-
-        return a.lnum < b.lnum
-    end)
-
-    set_quickfix(
-        "Diagnostics: " .. vim.fs.basename(filename),
-        items,
-        "No diagnostics in " .. vim.fs.basename(filename)
-    )
-end
-
-function M.typescript_path(path)
-    path = normalize_path(path)
-
-    local stat = vim.uv.fs_stat(path)
-
-    if not stat or (stat.type ~= "file" and stat.type ~= "directory") then
-        vim.notify("Invalid diagnostic path: " .. path, vim.log.levels.ERROR)
-        return
-    end
-
-    local is_file = stat.type == "file"
-    local config = find_typescript_config(path, is_file)
-
-    if not config then
         vim.notify(
-            "No tsconfig.json or jsconfig.json found for " .. path,
-            vim.log.levels.ERROR
+            "Current buffer has no file",
+            vim.log.levels.WARN
         )
         return
     end
 
-    local project_root = vim.fs.dirname(config)
+    local diagnostics = vim.diagnostic.get(bufnr)
+    local items = vim.diagnostic.toqflist(
+        diagnostics
+    )
+
+    open_quickfix(
+        "Diagnostics: "
+            .. vim.fn.fnamemodify(filename, ":t"),
+        items
+    )
+
+    if #items == 0 then
+        vim.notify(
+            "No diagnostics for current file",
+            vim.log.levels.INFO
+        )
+    end
+end
+
+function M.typescript_path(path)
+    if not path or path == "" then
+        vim.notify(
+            "No path selected",
+            vim.log.levels.WARN
+        )
+        return
+    end
+
+    local scope = selected_scope(path)
+    local config = find_typescript_config(
+        scope.path
+    )
+
+    if not config then
+        vim.notify(
+            "No tsconfig.json or jsconfig.json found",
+            vim.log.levels.WARN
+        )
+        return
+    end
+
+    local repo_root = find_repo_root(config)
 
     vim.system(
         {
@@ -220,32 +302,49 @@ function M.typescript_path(path)
             config,
         },
         {
-            cwd = project_root,
+            cwd = repo_root,
             text = true,
         },
         function(result)
             vim.schedule(function()
-                local items = parse_tsc_output(result.stdout or "", project_root)
+                local output = table.concat({
+                    result.stdout or "",
+                    result.stderr or "",
+                }, "\n")
+
+                local items = parse_tsc_output(
+                    output,
+                    repo_root
+                )
 
                 if result.code ~= 0 and #items == 0 then
-                    local message = vim.trim(
-                        (result.stdout or "") .. "\n" .. (result.stderr or "")
-                    )
-
                     vim.notify(
-                        message ~= "" and message or "TypeScript check failed",
+                        process_failure_message(result),
                         vim.log.levels.ERROR
                     )
                     return
                 end
 
-                items = filter_to_path(items, path, is_file)
-
-                set_quickfix(
-                    "TypeScript: " .. path,
+                items = filter_to_scope(
                     items,
-                    "No TypeScript errors under " .. path
+                    scope
                 )
+
+                open_quickfix(
+                    "TypeScript: "
+                        .. vim.fn.fnamemodify(
+                            scope.path,
+                            ":~:."
+                        ),
+                    items
+                )
+
+                if #items == 0 then
+                    vim.notify(
+                        "No TypeScript diagnostics in selected scope",
+                        vim.log.levels.INFO
+                    )
+                end
             end)
         end
     )
