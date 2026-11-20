@@ -4,6 +4,7 @@ table.sort(plugin_files)
 
 for _, file in ipairs(plugin_files) do
     local module = file
+        :gsub("\\", "/")
         :gsub("^.*/lua/", "")
         :gsub("%.lua$", "")
         :gsub("/", ".")
